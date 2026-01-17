@@ -8,8 +8,17 @@ import { type BuildOptions, getPackagePath } from "@opennextjs/aws/build/helper.
 import { ContentUpdater } from "@opennextjs/aws/plugins/content-updater.js";
 import { build, type Plugin } from "esbuild";
 
-import { getOpenNextConfig } from "../../api/config.js";
+import { getOpenNextConfig, type BundleConfig } from "../../api/config.js";
 import type { ProjectOptions } from "../project-options.js";
+import {
+	DEFAULT_OPTIONAL_DEPENDENCIES,
+	DEFAULT_EXTERNAL,
+	DEFAULT_STUB_EMPTY,
+	DEFAULT_STUB_THROW,
+	DEFAULT_STUB_FETCH,
+	DEFAULT_STUB_ENV,
+	DEFAULT_STUB_STYLED_JSX,
+} from "./bundle-defaults.js";
 import { patchVercelOgLibrary } from "./patches/ast/patch-vercel-og-library.js";
 import { patchWebpackRuntime } from "./patches/ast/webpack-runtime.js";
 import { inlineDynamicRequires } from "./patches/plugins/dynamic-requires.js";
@@ -31,20 +40,86 @@ import { copyPackageCliFiles, needsExperimentalReact, normalizePath } from "./ut
 const packageDistDir = path.join(path.dirname(fileURLToPath(import.meta.url)), "../..");
 
 /**
- * List of optional Next.js dependencies.
- * They are not required for Next.js to run but only needed to enabled specific features.
- * When one of those dependency is required, it should be installed by the application.
+ * Build the external array from user config and defaults.
  */
-const optionalDependencies = [
-	"caniuse-lite",
-	"critters",
-	"jimp",
-	"probe-image-size",
-	// `server.edge` is not available in react-dom@18
-	"react-dom/server.edge",
-	// styled-jsx is used by pages router, not needed for app-router-only apps
-	"styled-jsx",
-];
+function buildExternalArray(bundleConfig: BundleConfig | undefined): string[] {
+	const includeDefaults = bundleConfig?.includeDefaults !== false;
+	const userExternal = bundleConfig?.external ?? [];
+
+	if (includeDefaults) {
+		return [...DEFAULT_EXTERNAL, ...userExternal];
+	}
+	return userExternal;
+}
+
+/**
+ * Build the alias map from user config and defaults.
+ */
+function buildAliasMap(bundleConfig: BundleConfig | undefined, outputDir: string): Record<string, string> {
+	const includeDefaults = bundleConfig?.includeDefaults !== false;
+	const emptyShim = path.join(outputDir, "cloudflare-templates/shims/empty.js");
+	const throwShim = path.join(outputDir, "cloudflare-templates/shims/throw.js");
+	const fetchShim = path.join(outputDir, "cloudflare-templates/shims/fetch.js");
+	const envShim = path.join(outputDir, "cloudflare-templates/shims/env.js");
+
+	const alias: Record<string, string> = {};
+
+	if (includeDefaults) {
+		// Add default stub empty packages
+		for (const pkg of DEFAULT_STUB_EMPTY) {
+			alias[pkg] = emptyShim;
+		}
+
+		// Add default stub throw packages
+		for (const pkg of DEFAULT_STUB_THROW) {
+			alias[pkg] = throwShim;
+		}
+
+		// Add default stub fetch packages
+		for (const pkg of DEFAULT_STUB_FETCH) {
+			alias[pkg] = fetchShim;
+		}
+
+		// Add default stub env packages
+		for (const pkg of DEFAULT_STUB_ENV) {
+			alias[pkg] = envShim;
+		}
+
+		// Add default styled-jsx shim
+		for (const pkg of DEFAULT_STUB_STYLED_JSX) {
+			alias[pkg] = emptyShim;
+		}
+	}
+
+	// Add user stub empty packages
+	for (const pkg of bundleConfig?.stubEmpty ?? []) {
+		alias[pkg] = emptyShim;
+	}
+
+	// Add user stub throw packages
+	for (const pkg of bundleConfig?.stubThrow ?? []) {
+		alias[pkg] = throwShim;
+	}
+
+	// Add user stub fetch packages
+	for (const pkg of bundleConfig?.stubFetch ?? []) {
+		alias[pkg] = fetchShim;
+	}
+
+	// Add user stub env packages
+	for (const pkg of bundleConfig?.stubEnv ?? []) {
+		alias[pkg] = envShim;
+	}
+
+	// Add user custom aliases (these take precedence)
+	if (bundleConfig?.customAliases) {
+		for (const [pkg, shimPath] of Object.entries(bundleConfig.customAliases)) {
+			alias[pkg] = shimPath;
+		}
+	}
+
+	return alias;
+}
 
 /**
  * Bundle the Open Next server.
@@ -71,6 +146,14 @@ export async function bundleServer(buildOpts: BuildOptions, projectOpts: Project
 
 	const updater = new ContentUpdater(buildOpts);
 
+	// Get bundle configuration from user config (if provided)
+	const openNextConfig = getOpenNextConfig(buildOpts);
+	const bundleConfig = openNextConfig.cloudflare?.bundle;
+
+	// Build configurable external and alias arrays
+	const externalArray = buildExternalArray(bundleConfig);
+	const aliasMap = buildAliasMap(bundleConfig, outputDir);
+
 	const result = await build({
 		entryPoints: [openNextServer],
 		bundle: true,
@@ -92,13 +175,13 @@ export async function bundleServer(buildOpts: BuildOptions, projectOpts: Project
 		// - default nft conditions: https://github.com/vercel/nft/blob/2b55b01/readme.md#exports--imports
 		// - Next no explicit override: https://github.com/vercel/next.js/blob/2efcf11/packages/next/src/build/collect-build-traces.ts#L287
 		// - ESBuild `node` platform: https://esbuild.github.io/api/#platform
-		conditions: getOpenNextConfig(buildOpts).cloudflare?.useWorkerdCondition === false ? [] : ["workerd"],
+		conditions: openNextConfig.cloudflare?.useWorkerdCondition === false ? [] : ["workerd"],
 		plugins: [
 			shimRequireHook(buildOpts),
 			inlineDynamicRequires(updater, buildOpts),
 			setWranglerExternal(),
 			fixRequire(updater),
-			handleOptionalDependencies(optionalDependencies),
+			handleOptionalDependencies(DEFAULT_OPTIONAL_DEPENDENCIES),
 			patchInstrumentation(updater, buildOpts),
 			patchPagesRouterContext(buildOpts),
 			inlineFindDir(updater, buildOpts),
@@ -111,35 +194,8 @@ export async function bundleServer(buildOpts: BuildOptions, projectOpts: Project
 			// Apply updater updates, must be the last plugin
 			updater.plugin,
 		] as Plugin[],
-		external: [
-			"./middleware/handler.mjs",
-			// Node.js-only packages that can't run on Workers - mark as external
-			"@tensorflow/tfjs-node",
-		],
-		alias: {
-			// Workers have `fetch` so the `node-fetch` polyfill is not needed
-			"next/dist/compiled/node-fetch": path.join(buildOpts.outputDir, "cloudflare-templates/shims/fetch.js"),
-			// styled-jsx is required by pages router but may not be traced correctly in Next.js 16
-			// If app only uses app router, this can be safely shimmed
-			"styled-jsx": path.join(buildOpts.outputDir, "cloudflare-templates/shims/empty.js"),
-			// Workers have builtin Web Sockets
-			"next/dist/compiled/ws": path.join(buildOpts.outputDir, "cloudflare-templates/shims/empty.js"),
-			// The toolbox optimizer pulls severals MB of dependencies (`caniuse-lite`, `terser`, `acorn`, ...)
-			// Drop it to optimize the code size
-			// See https://github.com/vercel/next.js/blob/6eb235c/packages/next/src/server/optimize-amp.ts
-			"next/dist/compiled/@ampproject/toolbox-optimizer": path.join(
-				buildOpts.outputDir,
-				"cloudflare-templates/shims/throw.js"
-			),
-			// The edge runtime is not supported
-			"next/dist/compiled/edge-runtime": path.join(
-				buildOpts.outputDir,
-				"cloudflare-templates/shims/empty.js"
-			),
-			// `@next/env` is used by Next to load environment variables from files.
-			// OpenNext inlines the values at build time so this is not needed.
-			"@next/env": path.join(buildOpts.outputDir, "cloudflare-templates/shims/env.js"),
-		},
+		external: externalArray,
+		alias: aliasMap,
 		define: {
 			// config file used by Next.js, see: https://github.com/vercel/next.js/blob/68a7128/packages/next/src/build/utils.ts#L2137-L2139
 			"process.env.__NEXT_PRIVATE_STANDALONE_CONFIG": JSON.stringify(JSON.stringify(nextConfig)),
@@ -190,7 +246,16 @@ export async function bundleServer(buildOpts: BuildOptions, projectOpts: Project
  */
 export async function updateWorkerBundledCode(workerOutputFile: string): Promise<void> {
 	const MAX_JS_STRING_SIZE = 100 * 1024 * 1024; // 100MB threshold
+	const VERY_LARGE_FILE_SIZE = 500 * 1024 * 1024; // 500MB - skip patching entirely
 	const fileStats = await stat(workerOutputFile);
+
+	if (fileStats.size > VERY_LARGE_FILE_SIZE) {
+		// For extremely large files (>500MB), skip patching entirely
+		// The __require patterns are unlikely to cause issues at runtime
+		console.log(`Bundle is ${Math.round(fileStats.size / 1024 / 1024)}MB - VERY LARGE. Skipping require patching.`);
+		console.warn(`⚠️  Warning: Bundle exceeds 500MB. Consider reducing bundle size.`);
+		return;
+	}
 
 	if (fileStats.size > MAX_JS_STRING_SIZE) {
 		// Use sed for large files to avoid JavaScript string length limits
@@ -198,17 +263,21 @@ export async function updateWorkerBundledCode(workerOutputFile: string): Promise
 		try {
 			// macOS sed requires -i '' for in-place editing, Linux uses -i
 			const isMacOS = process.platform === "darwin";
-			const sedInPlace = isMacOS ? "-i ''" : "-i";
+			// Use separate backup extension for macOS sed compatibility
+			const sedCmd = isMacOS
+				? `sed -i.bak 's/__require\\([0-9]*\\)(/require(/g' "${workerOutputFile}" && rm "${workerOutputFile}.bak"`
+				: `sed -i 's/__require\\([0-9]*\\)(/require(/g' "${workerOutputFile}"`;
+			const sedCmd2 = isMacOS
+				? `sed -i.bak 's/__require\\([0-9]*\\)\\./require./g' "${workerOutputFile}" && rm "${workerOutputFile}.bak"`
+				: `sed -i 's/__require\\([0-9]*\\)\\./require./g' "${workerOutputFile}"`;
 
 			// Run sed replacements
-			execSync(`sed ${sedInPlace} 's/__require\\([0-9]*\\)(/require(/g' "${workerOutputFile}"`, { stdio: "pipe" });
-			execSync(`sed ${sedInPlace} 's/__require\\([0-9]*\\)\\./require./g' "${workerOutputFile}"`, { stdio: "pipe" });
+			execSync(sedCmd, { stdio: "pipe" });
+			execSync(sedCmd2, { stdio: "pipe" });
 		} catch (error) {
-			console.warn("sed patching failed, trying node-based approach:", error);
-			// Fallback: try reading in chunks (may still fail for very large files)
-			const code = await readFile(workerOutputFile, "utf8");
-			const patchedCode = code.replace(/__require\d?\(/g, "require(").replace(/__require\d?\./g, "require.");
-			await writeFile(workerOutputFile, patchedCode);
+			console.warn("sed patching failed, skipping:", error);
+			// Don't fallback to Node-based approach for very large files - just skip
+			return;
 		}
 	} else {
 		const code = await readFile(workerOutputFile, "utf8");

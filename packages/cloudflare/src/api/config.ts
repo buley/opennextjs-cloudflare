@@ -17,6 +17,80 @@ import assetResolver from "./overrides/asset-resolver/index.js";
 export type Override<T extends BaseOverride> = "dummy" | T | LazyLoadedOverride<T>;
 
 /**
+ * Bundle configuration for customizing esbuild aliasing and externals.
+ *
+ * This allows users to exclude packages from the bundle or replace them with shims.
+ * By default, OpenNext includes sensible defaults for Workers compatibility.
+ *
+ * @example
+ * ```ts
+ * export default defineCloudflareConfig({
+ *   bundle: {
+ *     // Add additional packages to mark as external
+ *     external: ["my-native-module"],
+ *     // Add packages to stub with empty exports
+ *     stubEmpty: ["my-heavy-package"],
+ *     // Custom aliases for specific packages
+ *     customAliases: {
+ *       "my-package": "./shims/my-package.js"
+ *     },
+ *     // Whether to include defaults (default: true)
+ *     includeDefaults: true,
+ *   }
+ * });
+ * ```
+ */
+export type BundleConfig = {
+	/**
+	 * Packages to mark as truly external (not bundled at all).
+	 * These are typically Node.js-only packages that cannot run on Workers.
+	 * @default ["./middleware/handler.mjs", "@tensorflow/tfjs-node"]
+	 */
+	external?: string[];
+
+	/**
+	 * Packages to stub with empty module exports.
+	 * These are imported at module level but often not actually used at runtime.
+	 * Stubbing them reduces bundle size significantly.
+	 */
+	stubEmpty?: string[];
+
+	/**
+	 * Packages to stub with a throwing implementation.
+	 * These will throw an error if actually called at runtime.
+	 */
+	stubThrow?: string[];
+
+	/**
+	 * Packages to replace with the fetch shim.
+	 * For fetch polyfills not needed in Workers.
+	 * @default ["next/dist/compiled/node-fetch", "node-fetch"]
+	 */
+	stubFetch?: string[];
+
+	/**
+	 * Packages to replace with the env shim.
+	 * OpenNext inlines env values at build time.
+	 * @default ["@next/env"]
+	 */
+	stubEnv?: string[];
+
+	/**
+	 * Custom aliases for specific packages.
+	 * These take precedence over default stubs.
+	 * Values should be paths to shim files.
+	 */
+	customAliases?: Record<string, string>;
+
+	/**
+	 * Whether to include the default bundle configuration.
+	 * Set to false to completely override defaults.
+	 * @default true
+	 */
+	includeDefaults?: boolean;
+};
+
+/**
  * Cloudflare specific overrides.
  *
  * See the [Caching documentation](https://opennext.js.org/cloudflare/caching))
@@ -55,6 +129,12 @@ export type CloudflareOverrides = {
 	 * @default "none"
 	 */
 	routePreloadingBehavior?: RoutePreloadingBehavior;
+
+	/**
+	 * Bundle configuration for customizing esbuild aliasing and externals.
+	 * Use this to exclude packages from the bundle or replace them with shims.
+	 */
+	bundle?: BundleConfig;
 };
 
 /**
@@ -71,6 +151,7 @@ export function defineCloudflareConfig(config: CloudflareOverrides = {}): OpenNe
 		cachePurge,
 		enableCacheInterception = false,
 		routePreloadingBehavior = "none",
+		bundle,
 	} = config;
 
 	return {
@@ -90,6 +171,7 @@ export function defineCloudflareConfig(config: CloudflareOverrides = {}): OpenNe
 		edgeExternals: ["node:crypto"],
 		cloudflare: {
 			useWorkerdCondition: true,
+			bundle,
 		},
 		dangerous: {
 			enableCacheInterception,
@@ -179,6 +261,12 @@ interface OpenNextConfig extends AwsOpenNextConfig {
 			// @default 7
 			maxVersionAgeDays?: number;
 		};
+
+		/**
+		 * Bundle configuration for customizing esbuild aliasing and externals.
+		 * Use this to exclude packages from the bundle or replace them with shims.
+		 */
+		bundle?: BundleConfig;
 	};
 }
 
